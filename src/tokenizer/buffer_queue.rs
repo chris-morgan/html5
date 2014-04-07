@@ -34,10 +34,19 @@ pub enum DataRunOrChar {
     OneChar(char),
 }
 
-/// Count the number of data characters at the beginning of 's'.
+#[cfg(terrifying_microoptimizations)]
 fn data_span(s: &str) -> uint {
+    arch::data_span(s)
+}
+
+#[cfg(not(terrifying_microoptimizations))]
+fn data_span(s: &str) -> uint {
+    data_span_generic(s.as_bytes())
+}
+
+fn data_span_generic(s: &[u8]) -> uint {
     let mut n = 0;
-    for b in s.bytes() {
+    for &b in s.iter() {
         match b {
         //  \0     \r     &      -      <
             0x00 | 0x0D | 0x26 | 0x2D | 0x3C => break,
@@ -171,6 +180,47 @@ impl Iterator<char> for BufferQueue {
 }
 
 
+#[cfg(terrifying_microoptimizations, target_arch="x86_64")]
+mod arch {
+    static non_data_chars: [u8, ..16] = [
+        0x0D, 0x26, 0x2D, 0x3C, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    pub fn data_span(s: &str) -> uint {
+        let head_len = s.len() & (!0xf);
+
+        let mut neg_remainder: uint = -head_len;
+        if head_len > 0 {
+            let mut off: uint;
+            unsafe {
+                asm!("
+                    movdqu ($3), %xmm0
+
+                 1: movdqu ($2,$0), %xmm1
+                    pcmpistri $$0, %xmm1, %xmm0
+                    jbe 2f
+                    add $$0x10, $0
+                    jnz 1b
+
+                 2:"
+                    : "=&r"(neg_remainder), "=&{ecx}"(off)
+                    : "r"((s.as_ptr() as uint) + head_len),
+                      "r"(non_data_chars.as_ptr()), "0"(neg_remainder)
+                    : "xmm0", "xmm1");
+            }
+
+            if (neg_remainder != 0) && (off < 16) {
+                return head_len + neg_remainder + off;
+            }
+        }
+
+        let pos = head_len + neg_remainder;
+        pos + super::data_span_generic(s.as_bytes().slice_from(pos))
+    }
+}
+
+
 #[test]
 fn smoke_test() {
     let mut bq = BufferQueue::new();
@@ -246,8 +296,23 @@ fn data_span_test() {
                 s.push_char(c);
                 pad(&mut s, y);
 
-                assert_eq!(x, data_span(s.as_slice()));
+                let d = x as int - data_span(s.as_slice()) as int;
+                if c == '\0' {
+                    assert!(d >= 0);
+                    assert!(d < 16);
+                } else {
+                    assert!(d == 0);
+                }
             }
         }
     }
+
+    // A multi-byte character spanning a boundary between 16-byte
+    // blocks, where the second block also contains a NULL.
+    //
+    // Make sure that the SSE4 code falls through to the byte-at-
+    // a-time search in this case; otherwise we split the string
+    // in the middle of a multi-byte character.
+    let s = "xxxxxxxxxxxxxx\ua66e\x00xxxxxxxxxxxxxx";
+    assert!(s.slice_to(data_span(s)).len() <= 17);
 }
